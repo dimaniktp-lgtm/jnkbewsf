@@ -1,4 +1,8 @@
-# pip install -U aiogram aiohttp
+#!/usr/bin/env python3
+# /root/vpnbot/bot.py
+# Установка зависимостей:
+#   apt install -y python3 python3-pip
+#   pip3 install --break-system-packages aiogram aiohttp
 import asyncio
 import json
 import re
@@ -18,7 +22,7 @@ from aiogram.types import (
 
 # ==================== НАСТРОЙКИ ====================
 TOKEN = "8751218718:AAEeldWQQn_7tzPXAP8WFQoHCKZ_wrKKV_E"
-WEB_HOST = "127.0.0.1"
+WEB_HOST = "127.0.0.1"   # nginx проксирует снаружи
 WEB_PORT = 8080
 MAX_CONFIGS = 10
 
@@ -34,7 +38,7 @@ WELCOME_TEXT = """👋 <b>Добро пожаловать!</b>
 
 <b>📌 Что тут есть:</b>
 • Свежие конфиги для обхода блокировок
-• Автоматическое определение страны по IP
+• Автоопределение страны по IP сервера
 • Поддержка WireGuard / AmneziaWG / OpenVPN
 
 <b>🚀 Как получить конфиг:</b>
@@ -51,14 +55,14 @@ WELCOME_TEXT = """👋 <b>Добро пожаловать!</b>
 
 VPN_TEXT = """🌐 <b>Доступные VPN-конфиги</b>
 
-Выбери сервер. Страна определяется автоматически по IP-адресу сервера.
+Выбери сервер. Страна определяется автоматически по IP.
 
 <b>📲 После выбора:</b>
 1. Скачай .conf файл
 2. Открой <b>Amnezia VPN</b>
 3. «+» → «Импорт из файла»
 4. Выбери скачанный файл
-5. Нажми «Подключиться»
+5. Подключись
 
 <b>⬇️ Выбирай сервер ниже:</b>"""
 
@@ -84,7 +88,7 @@ HELP_TEXT = """📖 <b>Помощь</b>
 ABOUT_TEXT = """ℹ️ <b>О боте</b>
 
 <b>VPN Config Bot</b>
-Раздаёт конфиги для Amnezia VPN и автоматически определяет страну сервера по IP.
+Раздаёт конфиги для Amnezia VPN и определяет страну сервера по IP.
 
 <b>Технологии:</b>
 • Python + aiogram 3
@@ -99,7 +103,6 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# кэш геоданных: ip -> {country, code, flag, city, isp}
 GEO_CACHE: dict[str, dict] = {}
 if CACHE_FILE.exists():
     try:
@@ -109,50 +112,47 @@ if CACHE_FILE.exists():
 
 
 def save_geo_cache():
-    CACHE_FILE.write_text(json.dumps(GEO_CACHE, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        CACHE_FILE.write_text(
+            json.dumps(GEO_CACHE, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 # ==================== ПАРСИНГ КОНФИГА ====================
-# WireGuard / AmneziaWG:  Endpoint = 1.2.3.4:51820
-# OpenVPN:                remote 1.2.3.4 1194
 WG_RE = re.compile(r"^\s*Endpoint\s*=\s*([^\s:]+):(\d+)", re.M | re.I)
 OVPN_RE = re.compile(r"^\s*remote\s+([^\s]+)\s+(\d+)", re.M | re.I)
 
 
-def extract_host(path: Path) -> str | None:
-    """Возвращает IP/hostname сервера из .conf / .ovpn."""
+def extract_host(path: Path):
     try:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         return None
-
     m = WG_RE.search(text) or OVPN_RE.search(text)
-    if m:
-        host = m.group(1).strip()
-        # если это домен — оставляем как есть, geoip сам разрезолвит
-        return host
-    return None
+    return m.group(1).strip() if m else None
 
 
 # ==================== ГЕОЛОКАЦИЯ ====================
 def code_to_flag(code: str) -> str:
-    """'NL' -> 🇳🇱"""
     if not code or len(code) != 2:
         return "🌐"
     code = code.upper()
-    return chr(0x1F1E6 + ord(code[0]) - ord("A")) + chr(0x1F1E6 + ord(code[1]) - ord("A"))
+    return (chr(0x1F1E6 + ord(code[0]) - ord("A")) +
+            chr(0x1F1E6 + ord(code[1]) - ord("A")))
 
 
 async def geo_lookup(host: str) -> dict:
-    """Возвращает {country, code, flag, city, isp}. Кэшируется."""
     if host in GEO_CACHE:
         return GEO_CACHE[host]
 
     result = {"country": "Неизвестно", "code": "", "flag": "🌐", "city": "", "isp": ""}
     try:
-        url = f"http://ip-api.com/json/{host}?fields=status,country,countryCode,city,isp,query"
+        url = f"http://ip-api.com/json/{host}?fields=status,country,countryCode,city,isp"
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=8) as r:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
                 data = await r.json()
         if data.get("status") == "success":
             result = {
@@ -171,33 +171,18 @@ async def geo_lookup(host: str) -> dict:
 
 
 async def get_config_info(path: Path) -> dict:
-    """Собирает инфу о конфиге: имя, размер, host, geo."""
     host = extract_host(path)
     if not host:
-        return {
-            "name": path.name,
-            "path": path,
-            "host": "?",
-            "country": "Неизвестно",
-            "flag": "❓",
-            "city": "",
-            "isp": "",
-        }
+        return {"name": path.name, "path": path, "host": "?",
+                "country": "Неизвестно", "flag": "❓", "city": "", "isp": "", "code": ""}
     geo = await geo_lookup(host)
-    return {
-        "name":    path.name,
-        "path":    path,
-        "host":    host,
-        "country": geo["country"],
-        "flag":    geo["flag"],
-        "code":    geo["code"],
-        "city":    geo["city"],
-        "isp":     geo["isp"],
-    }
+    return {"name": path.name, "path": path, "host": host,
+            "country": geo["country"], "flag": geo["flag"],
+            "city": geo["city"], "isp": geo["isp"], "code": geo["code"]}
 
 
 # ==================== УТИЛИТЫ ====================
-def list_configs() -> list[Path]:
+def list_configs():
     return sorted([f for f in CONFIGS_DIR.glob("*") if f.is_file()])
 
 
@@ -221,6 +206,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>VPN Configs</title>
 <style>
 body { font-family: -apple-system, sans-serif; max-width: 760px; margin: 40px auto;
@@ -246,7 +232,7 @@ input[type=file] { color: #ccc; font-size: 14px; margin-right: 10px; }
 </head>
 <body>
 <h1>🌐 VPN Configs</h1>
-<div class="sub">Загрузи до 10 конфигов — они появятся в Telegram-боте по команде /vpn. Страна определяется автоматически.</div>
+<div class="sub">Загрузи до 10 конфигов — они появятся в Telegram-боте по команде /vpn</div>
 
 <div class="box">
     <form action="/upload" method="post" enctype="multipart/form-data">
@@ -321,7 +307,6 @@ async def web_upload(request):
                 break
             f.write(chunk)
 
-    # сразу пробуем определить страну
     host = extract_host(target)
     geo_msg = ""
     if host:
@@ -348,7 +333,7 @@ async def start_web():
     await runner.setup()
     site = web.TCPSite(runner, WEB_HOST, WEB_PORT)
     await site.start()
-    print(f"🌐 Админка: http://{WEB_HOST}:{WEB_PORT}")
+    print(f"🌐 Админка (внутри): http://{WEB_HOST}:{WEB_PORT}")
 
 
 # ==================== TELEGRAM ====================
@@ -358,7 +343,7 @@ async def configs_kb() -> InlineKeyboardMarkup:
         info = await get_config_info(f)
         rows.append([InlineKeyboardButton(
             text=f"{info['flag']} {info['country']} — {f.name}",
-            callback_data=f"get:{f.name}"
+            callback_data=f"get:{f.name}",
         )])
     if not rows:
         rows.append([InlineKeyboardButton(text="Нет конфигов", callback_data="none")])
@@ -377,7 +362,7 @@ async def cmd_vpn(message: Message):
         await message.answer("❌ Конфигов пока нет. Зайди позже.")
         return
 
-    status = await message.answer("🔍 Определяю страны серверов...")
+    status = await message.answer("🔍 Определяю страны...")
     kb = await configs_kb()
     try:
         await status.delete()
@@ -386,7 +371,7 @@ async def cmd_vpn(message: Message):
 
     await message.answer(
         VPN_TEXT + f"\n\n<b>📦 Доступно: {len(files)}</b>",
-        reply_markup=kb
+        reply_markup=kb,
     )
 
 
@@ -418,7 +403,7 @@ async def cb_get(cb: CallbackQuery):
 
     caption = (
         f"{info['flag']} <b>{info['country']}</b>"
-        + (f" · {info['city']}" if info['city'] else "")
+        + (f" · {info['city']}" if info["city"] else "")
         + f"\n📄 <code>{p.name}</code>\n"
         f"🌍 <code>{info['host']}</code>\n\n"
         "📲 <b>Как подключить:</b>\n"
@@ -426,8 +411,7 @@ async def cb_get(cb: CallbackQuery):
         "2️⃣ Открой <b>Amnezia VPN</b>\n"
         "3️⃣ «+» → «Импорт из файла»\n"
         "4️⃣ Выбери скачанный файл\n"
-        "5️⃣ Подключись\n\n"
-        "⚡ Если не работает — попробуй другой сервер."
+        "5️⃣ Подключись"
     )
 
     await bot.send_document(
@@ -442,15 +426,13 @@ async def main():
     await start_web()
     await bot.set_my_commands([
         BotCommand(command="start", description="Добро пожаловать"),
-        BotCommand(command="vpn",   description="Получить VPN-конфиг"),
+        BotCommand(command="vpn",   description="Получить VPN"),
         BotCommand(command="help",  description="Помощь"),
         BotCommand(command="about", description="О боте"),
     ])
     me = await bot.get_me()
-    print(f"✅ Бот @{me.username} запущен")
-    print(f"📁 Конфиги: {CONFIGS_DIR.absolute()}")
-    print(f"🌐 Админка: http://{WEB_HOST}:{WEB_PORT}")
-    print("📌 Жду...")
+    print(f"✅ Бот @{me.username} запущен", flush=True)
+    print(f"📁 Конфиги: {CONFIGS_DIR}", flush=True)
     await dp.start_polling(bot)
 
 
